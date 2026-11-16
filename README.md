@@ -1,6 +1,6 @@
 ![(title)](title.png)
 
-![Python](https://img.shields.io/badge/Python-3.10-blue) [![Medium](https://img.shields.io/badge/Medium-Read%20Now-red?logo=medium)](https://medium.com/@fareedkhandev) ![Contributions](https://img.shields.io/badge/Contributions-Welcome-yellow) 
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)[![Medium](https://img.shields.io/badge/Medium-Read%20Now-red?logo=medium)](https://medium.com/@fareedkhandev) ![Contributions](https://img.shields.io/badge/Contributions-Welcome-yellow) 
 
 
 The entire training process of DeepSeek R1 is nothing but using different way of reinforcement learning on top of their base model (i.e. [deepseek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3))
@@ -20,7 +20,9 @@ The codebase is organized as follows:
 train-deepseek-r1/
 ├── code.ipynb         # Jupyter notebook with code implementation
 ├── requirements.txt   # List of required libraries
-└── r1_for_dummies.md  # DeepSeek R1 explanation for non-tech folks
+├── r1_for_dummies.md  # DeepSeek R1 explanation for non-tech folks
+├── tests/             # Tests for the notebook's reward functions and training setup
+└── CHANGELOG.md       # What changed in each release
 ```
 
 <!-- omit in toc -->
@@ -69,6 +71,13 @@ cd train-deepseek-r1
 pip install -r requirements.txt
 ```
 
+You need Python 3.11 or newer. The notebook is tested with Python 3.12 on Linux with one NVIDIA GPU, and a few things are worth knowing before you install:
+
+* The pinned PyTorch wheels are built for CUDA 13, which needs NVIDIA driver 580 or newer. With an older driver, `torch.cuda.is_available()` returns `False`.
+* [vLLM](https://github.com/vllm-project/vllm) only installs on Linux. It makes the GRPO training about five times faster, but the notebook runs without it.
+* On Windows, install PyTorch with CUDA from [pytorch.org](https://pytorch.org/get-started/locally/) first: the Windows wheel on PyPI is CPU only.
+* If you export the notebook to a script, call it something other than `code.py`, for example with `jupyter nbconvert --to script code.ipynb --output train_r1`. A `code.py` next to your script hides Python's built-in `code` module, which the debugger (`pdb`) imports.
+
 Now, let’s import the required libraries and set up the environment for our training.
 
 ```python
@@ -78,36 +87,29 @@ import os
 import sys
 import re
 import math
+import importlib.util
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 # Import PyTorch and Hugging Face Transformers
 import torch
-import transformers
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    HfArgumentParser,
     TrainingArguments,
-    set_seed,
     TrainerCallback,
     TrainerControl,
     TrainerState,
 )
-from transformers.trainer_utils import get_last_checkpoint
 
 # Import dataset utilities
-import datasets
 from datasets import load_dataset
 
 # Import libraries from TRL (Transformers Reinforcement Learning)
 from trl import (
-    AutoModelForCausalLMWithValueHead, 
-    PPOConfig, 
-    PPOTrainer, 
-    GRPOTrainer, 
-    GRPOConfig, 
-    SFTTrainer
+    GRPOTrainer,
+    GRPOConfig,
+    SFTTrainer,
+    SFTConfig,
 )
 
 # Import math-related utilities
@@ -125,7 +127,7 @@ So to stay as close as possible to the original replication, we will use these t
 
  2. [Bespoke-Stratos-17k](https://huggingface.co/datasets/bespokelabs/Bespoke-Stratos-17k) (For R1 Training)
 
-AI-MO/NuminaMath-TIR contains 70K math problems with messages column showing the COT (chain of though) reasoning behind the solution.
+AI-MO/NuminaMath-TIR contains 72,441 training and 99 test math problems, with a messages column showing the COT (chain of thought) reasoning behind the solution.
 
 | Field    | Description |  
 |----------|------------|  
@@ -135,7 +137,7 @@ AI-MO/NuminaMath-TIR contains 70K math problems with messages column showing the
 
 Take a look at its sample:
 ```python
-# Load the "AI-MO/NuminaMath-TIR" dataset from DigitalLearningGmbH
+# Load the "AI-MO/NuminaMath-TIR" dataset
 MATH_le = load_dataset("AI-MO/NuminaMath-TIR", "default")  
 
 # Access the first sample in the training set
@@ -144,9 +146,9 @@ MATH_le['train'][0]
 
 #### OUTPUT ####
 {
-'problem': 'What is the degree of the polynomial 4 +5x^3 ... ',
-'solution': 'This polynomial is not written in ...',
-'messages': [{'from': 'user', 'value': 'The problem ...'}]
+  'problem': 'What is the coefficient of $x^2y^6$ in the expansion of $\\left(\\frac{3 ...',
+  'solution': 'To determine the coefficient of \\(x^2y^6\\) in the expansion of \\(\\left ...',
+  'messages': [{'content': 'What is the coefficient of $x^2y^6$ in the expansion of $\\left(\\frac{3 ...', 'role': 'user'}, {'content': 'To determine the coefficient of \\(x^2y^6\\) in the expansion of \\(\\left ...', 'role': 'assistant'}],
 }
 #### OUTPUT ####
 ```
@@ -169,10 +171,10 @@ bespoke_rl['train'][0]
 
 #### OUTPUT ####
 {
-'system': 'Your role as an assistant involves ... ',
-'conversations': [{'from': 'user', 'value': 'Return your ...'}]
+  'system': 'Your role as an assistant involves thoroughly exploring questions thro ...',
+  'conversations': [{'from': 'user', 'value': 'Return your final response within \\boxed{}. The operation $\\otimes$ is ...'}, {'from': 'assistant', 'value': '<|begin_of_thought|>  Okay, let me try to figure out this problem. So, ...'}],
 }
- #### OUTPUT ####
+#### OUTPUT ####
 ```
 
 It’s not necessary to choose these datasets only, you can select any of your choice as long as it is reasoning focused (**a problem and its step-by-step solution**).
@@ -234,9 +236,9 @@ These are some basic info about the model, take a look at the total number of pa
 ```python
 # Initialize base model
 model = AutoModelForCausalLM.from_pretrained(
-  MODEL_NAME,
-  trust_remote_code=True,
-  torch_dtype=torch.bfloat16
+    MODEL_NAME,
+    trust_remote_code=True,
+    dtype=torch.bfloat16
 )
 
 print(f"Model parameters: {model.num_parameters():,}")
@@ -281,7 +283,8 @@ def test_model_inference(user_input: str):
         temperature=0.7
     )
 
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Decode only the newly generated tokens, not the prompt
+    response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
     return response
 
 # Test the model
@@ -292,8 +295,9 @@ print(f"Model Response: {response}")
 
 
 #### OUTPUT ####
-"Test Input: how are you?
-Model Response: As an AI language model I dont have feelings ..."
+Using device: cuda
+Test Input: how are you?
+Model Response: As an artificial intelligence language model, I don't have feelings or emotions like humans do, but I'm always here to assist you with any questions or tasks you may have! How can I help you today?
 #### OUTPUT ####
 ```
 So, the output of this tiny model is quite reliable and suitable for our DeepSeek lookalike model training for sure.
@@ -308,16 +312,16 @@ The initial version (R1 Zero) was created using Reinforcement Learning where (De
 
 ![Qwen 2.5 as an agent workflow (Created by [Fareed Khan](undefined))](https://cdn-images-1.medium.com/max/5410/1*S6YIXu1vIVmQFl-DgRFktg.png)
 
-The RL agent (DeepSeek V3/Qwen2–0.5B) starts by taking an **Action**, which means it generates an answer and some reasoning for a given problem that’s put into its **Environment**. The Environment, in this case, is simply the reasoning task itself.
+The RL agent (DeepSeek V3/Qwen2.5-0.5B) starts by taking an **Action**, which means it generates an answer and some reasoning for a given problem that’s put into its **Environment**. The Environment, in this case, is simply the reasoning task itself.
 
-After taking an action, the Environment gives back a **Reward**. This Reward is like feedback, it tells our base model (DeepSeek V3/Qwen2–0.5B) how good its action was. A positive Reward means it did something right, maybe got the answer correct or reasoned well. This feedback signal then goes back to our base model, helping it learn and adjust how it takes actions in the future to get even better Rewards.
+After taking an action, the Environment gives back a **Reward**. This Reward is like feedback, it tells our base model (DeepSeek V3/Qwen2.5-0.5B) how good its action was. A positive Reward means it did something right, maybe got the answer correct or reasoned well. This feedback signal then goes back to our base model, helping it learn and adjust how it takes actions in the future to get even better Rewards.
 > In the next section, we will be discussing this methodology in more detail
 
 ## GRPO Algorithm for R1 Zero
 
 So that we have understand a basic RL flow now we need to learn what exact RL algorithm DeepSeek uses for R1-Zero.
 
-There are many RL algos available, but traditional RL use something called a **“critic” **to help the main decision making part (“actor” i.e. DeepSeek-V3/Qwen2-0.5B). This critic is usually just as big and complex as the actor itself, which basically doubles the amount of computational cost.
+There are many RL algos available, but traditional RL use something called a **“critic” **to help the main decision making part (“actor” i.e. DeepSeek-V3/Qwen2.5-0.5B). This critic is usually just as big and complex as the actor itself, which basically doubles the amount of computational cost.
 
 But DeepSeek uses GRPO for training their initial (R1 Zero), **GRPO** does things differently because it figures out a baseline, a kind of reference point for good actions directly from the results it gets from a **group** of actions. Because of this, GRPO doesn’t need a separate critic model at all. This saves a lot of computation and makes things more efficient.
 
@@ -325,7 +329,7 @@ Let’s draw a flowchart of how GRPO is being used for R1 Zero training, and the
 
 ![GRPO Flow for DeepSeek R1 Zero (Created by [Fareed Khan](undefined))](https://cdn-images-1.medium.com/max/6404/1*8mfNzi-gvasR7mSaseswmg.png)
 
-Let’s understand how DeepSeek GRPO implementation works with our base model (Qwen2–0.5B). 
+Let’s understand how DeepSeek GRPO implementation works with our base model (Qwen2.5-0.5B). 
 
 First, the **Problem Input (A)** is given to the **Qwen Model (B)**, Qwen attempts to generate an answer through **Generate Completion (C)**. The final result, called the **Completion Output (D)**, includes reasoning steps in <think> tags and the final solution in <answer> tags.
 
@@ -341,7 +345,7 @@ Next, the **Problem Input (A)** and the **Ground Truth Solution (E)** are fed in
 
  5. **Repetition Penalty** (is there unnecessary repetition?).
 
-These evaluations produce **Reward Scores (G)**, which are then passed to the **GRPO Trainer (H)**. The trainer uses gradients to adjust the **Qwen Model (B)**, fine-tuning how it generates answers. This process is called **Gradient Reward Policy Optimization** because it optimizes Qwen responses using **gradients**, **reward feedback**, and **policy adjustments** to maximize performance.
+These evaluations produce **Reward Scores (G)**, which are then passed to the **GRPO Trainer (H)**. The trainer uses gradients to adjust the **Qwen Model (B)**, fine-tuning how it generates answers. This process is called **Group Relative Policy Optimization** (GRPO): each completion's reward is compared with the rewards of the other completions for the same problem, and the model is pushed towards the completions that did better than their group.
 
 Finally, the updated **Qwen Model (B)** is tested again on new problems, continuously refining itself through repeated cycles. With each iteration, Qwen becomes a better problem solver.
 
@@ -354,17 +358,13 @@ We are using the same thinking prompt template that DeepSeek uses for the GRPO a
 ```python
 # DeepSeek system prompt for GRPO based training
 SYSTEM_PROMPT = (
-  f"""A conversation between User and Assistant. The user asks a question, 
-      and the Assistant solves it. The assistant
-      first thinks about the reasoning process in the mind and 
-      then provides the user with the answer. The reasoning
-      process and answer are enclosed within <think> </think> 
-      and <answer> </answer> tags, respectively, i.e., 
-      <think> reasoning process here </think><answer> answer here </answer>
-   """
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
+    "<think> reasoning process here </think><answer> answer here </answer>"
 )
 ```
-This **system prompt** tells the base model (Qwen2–0.5B) its role as a helpful assistant who reasons step-by-step before answering.
+This **system prompt** tells the base model (Qwen2.5-0.5B) its role as a helpful assistant who reasons step-by-step before answering.
 
 The `<think>` and `<answer>` tags are used to structure the model response, separating its internal reasoning from the final answer for better evaluation and reward.
 
@@ -378,13 +378,13 @@ We need to create the make_conversation function that will handle the conversati
 ```python
 # Function to structure the training data
 def make_conversation(example):
-  """Convert dataset examples into conversation format."""
-  return {
-      "prompt": [
-          {"role": "system", "content": SYSTEM_PROMPT},
-          {"role": "user", "content": example["problem"]},
-      ],
-  }
+    """Convert dataset examples into conversation format."""
+    return {
+        "prompt": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": example["problem"]},
+        ],
+    }
 ```
 
 It will take each problem column value from our training dataset and return a dictionary with the system prompt and the appended problem question for each row. Let’s create this function that will prepare our dataset.
@@ -422,7 +422,6 @@ dataset = load_math_dataset()
 
 print(f"Train set size: {len(dataset['train'])}")
 print(f"Test set size: {len(dataset['test'])}")
-
 
 
 #### OUTPUT ####
@@ -473,16 +472,14 @@ def validate_dataset(dataset):
 validate_dataset(dataset)
 ```
 
-It output this:
+It outputs this:
 
 ```
 Validating train split:
-
 ✓ All required fields present
 ✓ Prompt format is correct
 
 Validating test split:
-
 ✓ All required fields present
 ✓ Prompt format is correct
 ```
@@ -526,7 +523,7 @@ def accuracy_reward(completions, solution, **kwargs):
     # Extract responses
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
-    
+
     for content, sol in zip(contents, solution):
         # Parse the ground truth solution
         gold_parsed = parse(sol, extraction_mode="first_match", 
@@ -542,8 +539,7 @@ def accuracy_reward(completions, solution, **kwargs):
                             nits=False,
                             malformed_operators=False,
                             basic_latex=True,
-                            equations=True,
-                            boxed="all",
+boxed="all",
                             units=True,
                         ),
                         boxed_match_priority=0,
@@ -553,8 +549,8 @@ def accuracy_reward(completions, solution, **kwargs):
                 extraction_mode="first_match",
             )
 
-            # Reward 1.0 if correct, 0.0 if incorrect
-            reward = float(verify(answer_parsed, gold_parsed))
+            # Reward 1.0 if correct, 0.0 if incorrect (the gold answer goes first, verify() is not symmetric)
+            reward = float(verify(gold_parsed, answer_parsed))
         else:
             # If ground truth cannot be parsed, assign neutral reward (0.5)
             reward = 0.5
@@ -590,22 +586,22 @@ Let’s code this up:
 ```python
 # Implement Format Reward Function
 def format_reward(completions, **kwargs):
-  """
-  Reward function to check if the completion has the correct format:
-  <think>...</think> <answer>...</answer>.
-  """
-  # Define the regex pattern for the desired format
-  pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    """
+    Reward function to check if the completion has the correct format:
+    <think>...</think> <answer>...</answer>.
+    """
+    # Define the regex pattern for the desired format
+    pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
 
-  # Extract the content from each completion
-  completion_contents = [completion[0]["content"] for completion in completions]
+    # Extract the content from each completion
+    completion_contents = [completion[0]["content"] for completion in completions]
 
-  # Check if each completion matches the pattern
-  matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE)
-             for content in completion_contents]
+    # Check if each completion matches the pattern
+    matches = [re.match(pattern, content, re.DOTALL)
+               for content in completion_contents]
 
-  # Reward 1.0 for correct format, 0.0 otherwise
-  return [1.0 if match else 0.0 for match in matches]
+    # Reward 1.0 for correct format, 0.0 otherwise
+    return [1.0 if match else 0.0 for match in matches]
 ```
 
 In this function:
@@ -614,7 +610,7 @@ In this function:
 
 * We get the actual text content from each model completion.
 
-* Then we use use re.match to see if each content perfectly matches our pattern. re.DOTALL helps the . in regex match newlines too, and re.MULTILINE makes ^ and $ match the start/end of the whole string, not just lines.
+* Then we use re.match to see if each content perfectly matches our pattern. re.DOTALL lets the . in the regex match newlines too. We do not pass re.MULTILINE: with it, $ also matches at the end of every line, so a completion that keeps writing after `</answer>` would still get the full reward.
 
 * Finally, we give a reward 1 if it matched the format perfectly, 0 if it didn’t. This is a strict on/off reward for format correctness.
 
@@ -700,16 +696,21 @@ def get_cosine_scaled_reward(
     based on completion length. Shorter correct solutions get higher rewards,
     longer incorrect solutions get less penalty.
     """
-    def cosine_scaled_reward(completions, solution, accuracy_rewards, **kwargs):
+    def cosine_scaled_reward(completions, solution, **kwargs):
         """
         Cosine scaled reward function that adjusts accuracy rewards based on completion length.
         """
         contents = [completion[0]["content"] for completion in completions]
+        accuracy_rewards = accuracy_reward(completions, solution) # 1.0 correct, 0.0 wrong, 0.5 unparseable gold
         rewards = []
 
-        for content, sol, acc_reward in zip(contents, solution, accuracy_rewards):
-            gen_len = len(content)  # Length of the generated answer
-            progress = gen_len / max_len # How far we are to max length
+        for content, acc_reward in zip(contents, accuracy_rewards):
+            if acc_reward == 0.5: # The gold answer could not be parsed, so there is nothing to scale
+                rewards.append(0.0)
+                continue
+
+            gen_len = len(content)  # Length of the generated answer (in characters)
+            progress = min(gen_len / max_len, 1.0) # How far we are to max length (capped at 1)
             cosine = math.cos(progress * math.pi) # Cosine value based on progress
 
             if acc_reward > 0.5: # Assuming accuracy_reward gives ~1.0 for correct answers
@@ -728,9 +729,9 @@ def get_cosine_scaled_reward(
 
 `get_cosine_scaled_reward(...)` generates a reward function for training, customizing scaling with parameters like min_value_wrong/max_value_wrong (penalty range for incorrect answers) and min_value_correct/max_value_correct (reward range for correct ones). max_len sets the maximum length for scaling.
 
-Inside, `cosine_scaled_reward(...)` we calculate rewards based on completions, solution, and accuracy_rewards.
+Inside, `cosine_scaled_reward(...)` first scores every completion with our `accuracy_reward`, so it only needs the completions and the solution column, which the trainer passes to every reward function. If the gold answer cannot be parsed (accuracy 0.5), the completion gets 0.
 
-It computes gen_len, normalizes it as progress `= gen_len / max_len`, and derives a cosine value that starts at 1 (short answers) and decreases to -1 (long answers).
+It computes gen_len (the length of the completion in characters), normalizes it as progress `= min(gen_len / max_len, 1)` and derives a cosine value that starts at 1 (short answers) and decreases to -1 (answers of max_len characters or longer). Without the cap, the cosine would climb back up for completions longer than max_len, and a 2,000 character answer would score like an empty one.
 
 If `acc_reward > 0.5`, it uses the correct reward range, otherwise it applies the incorrect range but swaps min/max values to penalize longer wrong answers less.
 
@@ -784,7 +785,7 @@ def get_repetition_penalty_reward(ngram_size: int = 3, max_penalty: float = -0.1
             reward = scaling * max_penalty # Apply penalty based on scaling
             rewards.append(reward)
         return rewards
-    return get_repetition_penalty_reward
+    return repetition_penalty_reward
 ```
 
 Our `get_repetition_penalty_reward(...)` creates a reward function to penalize repetition, with parameters like ngram_size (default 3, for trigrams) and max_penalty (a negative value, e.g., -0.1).
@@ -854,68 +855,62 @@ The reward_funcs list decides which rewards to use, starting with ["accuracy", "
 
 Some settings control how the cosine_scaled_reward and repetition_penalty_reward work, letting you adjust how rewards are given.
 
-Next up, we have TrainingArguments from the transformers library. This is the **main** configuration object that controls almost **everything** about the training process.
+Next up, we have GRPOConfig from TRL. It extends the TrainingArguments class of transformers, so it is the **main** configuration object that controls almost **everything** about the training process, and it adds the GRPO settings, such as how many completions to sample for each problem.
 ```python
-# Define TrainingArguments from transformers
-training_args = TrainingArguments(
+# Use vLLM to generate the completions when it is installed (Linux with an NVIDIA GPU).
+# It is several times faster than model.generate(), which the trainer uses otherwise.
+USE_VLLM = torch.cuda.is_available() and importlib.util.find_spec("vllm") is not None
+
+# Define the training configuration (GRPOConfig extends TrainingArguments from transformers)
+training_args = GRPOConfig(
     output_dir=OUTPUT_DIR,          # Output directory for checkpoints and logs
-    overwrite_output_dir=True,
     num_train_epochs=1,             # Total number of training epochs
-    per_device_train_batch_size=8,  # Batch size per device during training
-    per_device_eval_batch_size=16,   # Batch size for evaluation
+    max_steps=300,                  # Stop after 300 steps (remove it to train the whole epoch)
+    per_device_train_batch_size=8,  # Completions per device per step (one problem x 8 generations)
+    per_device_eval_batch_size=16,  # Batch size for evaluation
     gradient_accumulation_steps=2,  # Accumulate gradients to simulate larger batch size
-    learning_rate=5e-5,            # Initial learning rate for AdamW optimizer
-    warmup_ratio=0.1,              # Linear warmup over warmup_ratio fraction of training steps
-    weight_decay=0.01,             # Apply weight decay to all layers except bias and LayerNorm weights
-    logging_steps=10,              # Log every X updates steps
-    evaluation_strategy="steps",    # Evaluate every `eval_steps`
-    eval_steps=50,                 # Evaluation and logging steps
-    save_strategy="steps",         # Save checkpoint every `save_steps`
-    save_steps=50,                 # Save checkpoint every X updates steps
-    save_total_limit=2,            # Limit the total amount of checkpoints. Deletes the older checkpoints.
-    dataloader_num_workers=2,      # Number of subprocesses to use for data loading
-    seed=42,                       # Random seed for reproducibility
-    bf16=True,                     # Use mixed precision BFP16 training
-    push_to_hub=False,             # Whether to push the final model to Hugging Face Hub
-    gradient_checkpointing=True,   # Enable gradient checkpointing
-    report_to="none",              # Reporting to no one
-    remove_unused_columns=False,   # Do not remove unused columns from the dataset
+    learning_rate=1e-6,             # Initial learning rate for AdamW optimizer
+    warmup_steps=0.1,               # Linear warmup over the first 10% of the training steps
+    weight_decay=0.01,              # Apply weight decay to all layers except bias and LayerNorm weights
+    logging_steps=10,               # Log every X updates steps
+    eval_strategy="steps",          # Evaluate every `eval_steps`
+    eval_steps=50,                  # Evaluation and logging steps
+    eval_on_start=True,             # Also evaluate before training, to compare with
+    save_strategy="steps",          # Save checkpoint every `save_steps`
+    save_steps=50,                  # Save checkpoint every X updates steps
+    save_total_limit=2,             # Limit the total amount of checkpoints. Deletes the older checkpoints.
+    dataloader_num_workers=2,       # Number of subprocesses to use for data loading
+    seed=42,                        # Random seed for reproducibility
+    bf16=True,                      # Use BF16 (bfloat16) precision
+    push_to_hub=False,              # Whether to push the final model to Hugging Face Hub
+    gradient_checkpointing=True,    # Enable gradient checkpointing
+    report_to="none",               # Reporting to no one
+    remove_unused_columns=False,    # Keep the "solution" column, the accuracy reward needs it
+    # GRPO settings
+    num_generations=8,              # Completions sampled for each problem (the "group" in GRPO)
+    max_completion_length=512,      # Longest completion in tokens, longer ones are cut off
+    use_vllm=USE_VLLM,              # Generate with vLLM when it is available
+    vllm_mode="colocate",           # Run vLLM inside this process, on the same GPU
+    vllm_gpu_memory_utilization=0.3,  # Share of the GPU memory that vLLM may use
 )
 ```
 
-Finally, we need to have a ModelConfig. This is where we put settings that are specific to the **model itself**, like which pre-trained model to use, what data type to use (like bfloat16), and whether to trust remote code or not and so.
+A few of these settings matter a lot for GRPO:
 
-Let’s define our ModelConfig:
-```python
-@dataclass
-class ModelConfig:
-    """
-    Configuration for the model.
-    """
-    model_name_or_path: str = field(
-        default=MODEL_NAME, metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
-    )
-    model_revision: Optional[str] = field(
-        default="main", metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."}
-    )
-    torch_dtype: Optional[str] = field(
-        default="bfloat16", metadata={"help": "Override the default `torch_dtype` and load the model under this dtype."}
-    )
-    trust_remote_code: bool = field(
-        default=True, metadata={"help": "Trust remote code when loading model and tokenizer."}
-    )
-    attn_implementation: Optional[str] = field(
-        default="flash_attention_2", metadata={"help": "Attention implementation to use. 'flash_attention_2' or None"}
-    )
-```
+* **num_generations**: GRPO samples a group of completions for every problem and compares their rewards with each other. With 8 completions per problem and 16 completions per optimizer step (8 per device times 2 accumulation steps), each step learns from 2 problems.
 
-Our **ModelConfig** class holds key settings, including model_name_or_path, which defaults to **Qwen 0.5B Instruct**. We use torch_dtype="bfloat16" for efficiency and set trust_remote_code=True for safe remote loading. Additionally, attn_implementation="flash_attention_2" is enabled for potentially faster training if supported.
+* **max_completion_length**: completions are cut off at 512 tokens. A completion that is cut off never reaches `</answer>`, so it gets no format reward.
 
-Now we need to actually **create** instances of these configuration classes so we can use them:
+* **max_steps**: one epoch over the 72,441 training problems is 36,220 steps, which takes about a day on one RTX A6000 with vLLM. We stop after 300 steps, enough to see how training behaves. Remove `max_steps` to train the whole epoch.
+
+* **learning_rate**: RL fine-tuning needs a much smaller learning rate than supervised fine-tuning. We use 1e-6, TRL's default for GRPO. With 5e-5, the value earlier versions of this notebook used, the accuracy on the 99 test problems fell from 16.6% to 0% within 100 steps and stayed below 1%: every completion got the same reward, so there was nothing left to learn from.
+
+* **use_vllm**: generating the completions is the slowest part of GRPO. [vLLM](https://github.com/vllm-project/vllm) does it several times faster than `model.generate()`, so we use it when it is installed (it needs Linux and an NVIDIA GPU). Everything else works without it, only slower.
+
+Now we need to actually **create** an instance of our reward settings:
 ```python
 # Instantiate configuration objects
 script_args = GRPOScriptArguments()
-model_args = ModelConfig()
 ```
 
 Next, we need to get our list of reward functions and any “callbacks” we want to use during training.
@@ -954,19 +949,27 @@ def get_reward_functions(script_args):
 
     return reward_funcs_list
 ```
-Our callback function which will track loss and other important info.
+Our callback function which will track loss and other important info. It runs every time the trainer logs, so it reads the numbers the trainer has just computed.
 ```python
+logging.basicConfig(stream=sys.stdout)  # Print log messages in the notebook
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # Show our INFO messages (other libraries stay at WARNING)
 
 class LoggingCallback(TrainerCallback):
     """
-    A simple callback for logging training information at specific steps.
+    A simple callback that logs the loss, the learning rate and the mean of each reward
+    every time the trainer logs (every `logging_steps` steps).
     """
-    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        if state.global_step % args.logging_steps == 0:
-            logger.info(f"Step {state.global_step}: Loss = {state.log_history[-1].get('loss', None)}, Learning Rate = {state.log_history[-1].get('learning_rate', None)}")
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
+        if not logs or "loss" not in logs:  # Skip evaluation logs, they carry "eval_loss" instead
+            return
+        message = f"Step {state.global_step}: Loss = {logs['loss']:.4f}, Learning Rate = {logs.get('learning_rate', 0):.2e}"
+        for key, value in logs.items():
+            if key.startswith("rewards/") and key.endswith("/mean"):  # e.g. rewards/format_reward/mean
+                message += f", {key.split('/')[1]} = {value:.3f}"
+        logger.info(message)
 
-def get_callbacks(training_args, model_args, script_args):
+def get_callbacks(training_args, script_args):
     """
     Returns a list of callbacks to be used during training.
     For now, it includes only the LoggingCallback. You can extend this to add more callbacks.
@@ -979,7 +982,7 @@ Finally, initializing these function.
 ```python
 # Get reward functions and callbacks
 reward_functions = get_reward_functions(script_args)
-callbacks = get_callbacks(training_args, model_args, script_args)
+callbacks = get_callbacks(training_args, script_args)
 ```
 
 ## GRPO Training Loop
@@ -988,22 +991,14 @@ This is the engine that will actually drive our GRPO training. We need to initia
 
 Let’s initialize the GRPOTrainer:
 ```python
-# Create GRPOConfig from TrainingArguments
-grpo_config = GRPOConfig(
-    **training_args.to_dict(), # Convert TrainingArguments to dictionary and unpack
-    **{ 
-       # REMOVED model_init_kwargs here 
-       # We are passing the instantiated 'model' object, so GRPOTrainer doesn't need model_init_kwargs
-    }
-)
-
+# Initialize the GRPO trainer
 grpo_trainer = GRPOTrainer(
     model=model,                      # Our initialized Qwen model
     reward_funcs=reward_functions,    # List of reward functions from previous step
-    args=grpo_config,                # GRPOConfig (created from TrainingArguments)
+    args=training_args,               # GRPOConfig defined above
     train_dataset=dataset['train'],   # Training dataset
-    eval_dataset=dataset['test'],    # Evaluation dataset
-    callbacks=callbacks              # List of callbacks
+    eval_dataset=dataset['test'],     # Evaluation dataset
+    callbacks=callbacks               # List of callbacks
 )
 ```
 
@@ -1012,14 +1007,43 @@ We can now start the **Training Loop**! This is as simple as calling the train()
 # Start the GRPO Training Loop
 train_result = grpo_trainer.train()
 ```
-When you run this cell, you should see the training process begin.
+When you run this cell, the training starts, and our callback prints a line every 10 steps:
 ```
+INFO:__main__:Step 10: Loss = 0.0137, Learning Rate = 3.00e-07, accuracy_reward = 0.113, format_reward = 0.000
+INFO:__main__:Step 20: Loss = -0.0026, Learning Rate = 6.33e-07, accuracy_reward = 0.094, format_reward = 0.000
+INFO:__main__:Step 30: Loss = 0.0219, Learning Rate = 9.67e-07, accuracy_reward = 0.087, format_reward = 0.000
+INFO:__main__:Step 40: Loss = -0.0401, Learning Rate = 9.67e-07, accuracy_reward = 0.250, format_reward = 0.000
+INFO:__main__:Step 50: Loss = 0.0209, Learning Rate = 9.30e-07, accuracy_reward = 0.081, format_reward = 0.000
 ...
-INFO:__main__:Step 10: Loss = ..., Learning Rate = ...
-INFO:__main__:Step 20: Loss = ..., Learning Rate = ...
+INFO:__main__:Step 100: Loss = -0.0225, Learning Rate = 7.44e-07, accuracy_reward = 0.113, format_reward = 0.000
 ...
+INFO:__main__:Step 150: Loss = -0.0235, Learning Rate = 5.59e-07, accuracy_reward = 0.044, format_reward = 0.000
+...
+INFO:__main__:Step 200: Loss = -0.0019, Learning Rate = 3.74e-07, accuracy_reward = 0.094, format_reward = 0.000
+...
+INFO:__main__:Step 250: Loss = 0.0269, Learning Rate = 1.89e-07, accuracy_reward = 0.131, format_reward = 0.000
+...
+INFO:__main__:Step 300: Loss = 0.0212, Learning Rate = 3.70e-09, accuracy_reward = 0.125, format_reward = 0.000
 ```
-Training will take some time but we set **num_train_epochs = 1** and are using a small model, it shouldn’t take *too* long for this example.
+On one RTX A6000 with vLLM, the 300 steps took 23 minutes: 2.6 seconds per step, plus about 95 seconds for each of the seven evaluations on the 99 test problems. Without vLLM a step takes about 13 seconds. The GPU memory peaked at 20 GB, most of it the 30% share we gave vLLM; without vLLM the peak is 5.7 GB.
+
+The evaluations show what the 300 steps did:
+
+| Step | Accuracy reward | Format reward | Mean completion length |
+|---:|---:|---:|---:|
+| 0 (before training) | 0.166 | 0.000 | 413 tokens |
+| 50 | 0.158 | 0.001 | 416 tokens |
+| 100 | 0.147 | 0.000 | 411 tokens |
+| 150 | 0.154 | 0.001 | 416 tokens |
+| 200 | 0.151 | 0.000 | 415 tokens |
+| 250 | 0.160 | 0.000 | 417 tokens |
+| 300 | 0.168 | 0.000 | 417 tokens |
+
+Not much changed, and that is what to expect: 300 steps of 2 problems each, at a learning rate this small, barely move a model. The accuracy went from 16.6% to 16.8%. This run shows the mechanics; the whole epoch is 36,220 steps.
+
+The format reward stays at about 0 for a different reason: the base model almost never writes the `<think>` and `<answer>` tags. In 96 completions we sampled with this prompt, one contained `<think>` and none matched the format. When every completion of a problem gets the same reward, GRPO has nothing to compare, so the format reward cannot teach anything until the model writes the format now and then. DeepSeek-R1 avoids this cold start of RL by first fine-tuning on a small amount of long chain-of-thought data, which we get to below.
+
+With the learning rate of 5e-5 that earlier versions of this notebook used, the run broke down instead: the accuracy on the test problems fell from 16.6% to 0% within 100 steps and stayed below 1%.
 
 But for real-world GRPO DeepSeek R1 Zero training, you’d likely train for many more epochs and steps.
 
@@ -1037,6 +1061,11 @@ tokenizer.save_pretrained(TRAINED_MODEL_PATH)
 grpo_trainer.save_model(TRAINED_MODEL_PATH)
 
 print(f"GRPO Trained model saved to {TRAINED_MODEL_PATH}")
+
+
+#### OUTPUT ####
+GRPO Trained model saved to data/Qwen-GRPO-training
+#### OUTPUT ####
 ```
 Then we can simply load the trained model using:
 ```python
@@ -1055,7 +1084,7 @@ if tokenizer.pad_token is None:
 trained_model = AutoModelForCausalLM.from_pretrained(
     TRAINED_MODEL_PATH,
     trust_remote_code=True, # If your model architecture requires it
-    torch_dtype=torch.bfloat16 # Keep the same dtype as training for consistency
+    dtype=torch.bfloat16 # Keep the same dtype as training for consistency
 )
 
 # Move the loaded model to your device (GPU if available)
@@ -1086,21 +1115,58 @@ def test_trained_model_inference(user_input: str):
     # Generate output using our *trained_model*
     outputs = trained_model.generate(
         **inputs,
-        max_new_tokens=200, # Maybe generate a bit longer now
+        max_new_tokens=512, # Same limit as max_completion_length in training
         do_sample=True,
         temperature=0.7
     )
 
-    # Decode the generated tokens back to text
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Decode the generated tokens back to text (only the new ones, not the prompt)
+    response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
     return response
+
+# Test the model on a problem from the test split
+test_input = dataset['test'][0]['problem']
+response = test_trained_model_inference(test_input)
+print(f"Test Input: {test_input}")
+print(f"Trained Model Response: {response}")
+
+
+#### OUTPUT ####
+Test Input: In 1988, a person's age was equal to the sum of the digits of their birth year. How old was this person?
+Trained Model Response: To solve this problem, we need to find a year such that when its digits are added together, the result is equal to the original year.
+
+Let's start by listing the possible years:
+
+- 20th century: 2000, 21st century: 2100, etc.
+
+We will check each year to see if adding the digits results in the same number as the original year.
+
+For example:
+- For 2000: \( 2 + 0 + 0 = 2 \)
+- For 2100: \( 2 + 1 + 0 = 3 \)
+...
+The only year that fits the criteria is 2016. Therefore, the person's age in 1988 was 2016.
+
+So, the answer is 2016.
+#### OUTPUT ####
+```
+
+The response is sampled (`do_sample=True`), so yours will be different. Like the evaluations above, it shows a model that still answers in its usual style, without the `<think>` and `<answer>` tags, and here it gets the answer wrong (the person was 22).
+
+Before we move on, we free the GPU memory that the GRPO trainer still holds:
+```python
+# Free the GPU memory used by the GRPO stage
+import gc
+del grpo_trainer, trained_model, model
+gc.collect()
+torch.cuda.empty_cache()
 ```
 
 ## Two main problems with R1 Zero
 
-Now that we have completed our R1 zero training approach using our base model Qwen2–0.5B instead of their DeepSeek V3 (original base model).
+Now that we have completed our R1 zero training approach using our base model Qwen2.5-0.5Binstead of their DeepSeek V3 (original base model).
 
-We cannot identify our trained model problems but researches of DeepSeek saw the R1 Zero model performed really well on reasoning tests, even scoring similarly to more advanced models like **OpenAI-01–0912** on tasks like **AIME 2024**.
+We cannot identify our trained model problems but researches of DeepSeek saw the R1 Zero model performed really well on reasoning tests, even scoring similarly to more advanced models like **OpenAI-o1-0912**on tasks like **AIME 2024**.
 
 This showed that using reinforcement learning (RL) to encourage reasoning in language models is a promising approach.
 
@@ -1133,7 +1199,7 @@ One of the example of cold start data is [Bespoke-Stratos-17k](https://huggingfa
 
 ## Few-shot Prompting with Long CoT
 
-One technique is **Few-shot Prompting with Long Chain-of-Thought (CoT),** in which we try to show DeepSeek-V3 Base (or in our case, Qwen2–0.5B) few examples of questions paired with super detailed, step-by-step solutions. This is Chain-of-Thought (CoT).
+One technique is **Few-shot Prompting with Long Chain-of-Thought (CoT),** in which we try to show DeepSeek-V3 Base (or in our case, Qwen2.5-0.5B) few examples of questions paired with super detailed, step-by-step solutions. This is Chain-of-Thought (CoT).
 
 ![Long CoT (Created by [Fareed Khan](undefined))](https://cdn-images-1.medium.com/max/4068/1*SAhvB0JqaK4d45IiIcj1Ow.png)
 
@@ -1146,7 +1212,7 @@ MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, padding_side="right")
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True, torch_dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
 
 # Generate Long COT Response
 def generate_response(prompt_text):
@@ -1157,8 +1223,9 @@ def generate_response(prompt_text):
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=200, do_sample=False) # Keep it deterministic for example
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return response.split("<|im_start|>assistant\n")[-1].strip() # Extract assistant's response
+    # Decode only the new tokens, which are the assistant's response
+    response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    return response.strip()
 ```
 Let’s define the few shot examples accordingly for our asked question:
 ```python
@@ -1169,16 +1236,13 @@ Solution: <|special_token|> First, find the square root of 9, which is 3. Then, 
 
 Problem: Train travels at 60 mph for 2 hours, how far?
 Solution: <|special_token|> Use the formula: Distance = Speed times Time. Speed is 60 mph, Time is 2 hours. Distance = 60 * 2 = 120 miles. <|special_token|> Summary: Train travels 120 miles.
-
-Problem: What is 2 + 3 * 4?
-Solution:
 """
 ```
 
 Now using our base model our sample generations looks like this:
 ```python
 # Generate response for the target problem using few-shot examples
-target_problem_prompt = few_shot_prompt + "What is 2 + 3 * 4?"
+target_problem_prompt = few_shot_prompt + "\nProblem: What is 2 + 3 * 4?\nSolution:"
 model_response_few_shot = generate_response(target_problem_prompt)
 
 print("Few-shot Prompt:")
@@ -1187,35 +1251,35 @@ print("\nModel Response (Few-shot CoT):")
 print(model_response_few_shot)
 ```
 
-It output this structured data
+It outputs this:
 
 ```
 Few-shot Prompt:
+
 Problem: What's the square root of 9 plus 5?
-Solution: <|special_token|> First, find the square root of 9, 
-which is 3. Then, add 5 to 3.  3 + 5 equals 8. 
-<|special_token|> Summary: The answer is 8.
+Solution: <|special_token|> First, find the square root of 9, which is 3. Then, add 5 to 3.  3 + 5 equals 8. <|special_token|> Summary: The answer is 8.
 
 Problem: Train travels at 60 mph for 2 hours, how far?
-Solution: <|special_token|> Use the formula: Distance = Speed times Time. 
-Speed is 60 mph, Time is 2 hours. Distance = 60 * 2 = 120 miles. 
-<|special_token|> Summary: Train travels 120 miles.
+Solution: <|special_token|> Use the formula: Distance = Speed times Time. Speed is 60 mph, Time is 2 hours. Distance = 60 * 2 = 120 miles. <|special_token|> Summary: Train travels 120 miles.
 
 Problem: What is 2 + 3 * 4?
-Solution: 
+Solution:
 
 Model Response (Few-shot CoT):
-<|special_token|> To solve 2 + 3 * 4, we need to follow the order 
-of operations (PEMDAS/BODMAS). Multiplication should be performed 
-before addition.
-Step 1: Multiply 3 by 4, which equals 12.
-Step 2: Add 2 to the result from Step 1: 2 + 12 = 14.
-<|special_token|> Summary: The answer is 14.
+The problem "What is 2 + 3 * 4?" requires us to follow the order of operations (PEMDAS/BODMAS), which stands for Parentheses/Brackets, Exponents/Orders, Multiplication and Division (from left to right), Addition and Subtraction (from left to right).
+
+Here’s the step-by-step solution:
+
+1. **Parentheses**: There are no parentheses in this expression.
+2. **Exponents**: There are no exponents in this expression.
+3. **Multiplication and Division**: Perform these operations from left to right:
+   - First, multiply 3 by 4: \(3 \times 4 = 12\).
+   - Next, perform addition: \(2 + 12 = 14\).
+
+So, the final result is \(14\).
 ```
 
-See how the model, after seeing examples, starts to structure its answer with <|special_token|> delimiters and provides step-by-step reasoning leading to the summary and final answer!
-
-This is the power of few-shot learning guiding the model towards the desired output format.
+The model reasons step by step and gets 14, but it answers in its usual markdown style instead of copying the `<|special_token|>` layout of the examples: two examples were not enough for this small model to pick up the format.
 
 ## Direct Prompting
 
@@ -1240,24 +1304,38 @@ print(direct_prompt_text)
 print("\nModel Response (Direct Prompting):")
 print(model_response_direct)
 ```
-The direct prompting output is very easy to understand and this is what it looks like:
+The direct prompting output looks like this:
 ```
 Direct Prompt:
+
 Problem: Solve this, show reasoning step-by-step, and verify:
 What is 2 + 3 * 4?
 
+
 Model Response (Direct Prompting):
-<|special_token|> Reasoning: To solve 2 + 3 * 4, I need to follow 
-the order of operations, which states that multiplication should 
-be done before addition.
-Step 1: Multiply 3 by 4, which equals 12.
-Step 2: Add 2 to the result from Step 1: 2 + 12 = 14.
-Verification: To verify the answer, I can double-check the 
-order of operations and the calculations. Multiplication is 
-indeed performed before addition, and the calculations are correct.
-<|special_token|> Summary: The answer is 14.
+To solve the expression \(2 + 3 \times 4\), we need to follow the order of operations, often remembered by the acronym PEMDAS (Parentheses, Exponents, Multiplication and Division (from left to right), Addition and Subtraction (from left to right)).
+
+Step 1: Evaluate the multiplication first.
+\[3 \times 4 = 12\]
+
+So now our expression looks like this:
+\[2 + 12\]
+
+Step 2: Perform the addition.
+\[2 + 12 = 14\]
+
+Therefore, the result of \(2 + 3 \times 4\) is \(14\).
+
+**Verification:**
+Let's break it down step-by-step:
+
+1. **Multiplication**: First, perform the multiplication inside the parentheses.
+   \[3 \times 4 = 12\]
+   
+2. **Addition**: Now add the results from the previous steps.
+   \[2
 ```
-As you can see, by directly asking for reasoning and verification, the model provides a more comprehensive output, including a “Verification” section.
+By directly asking for reasoning and verification, we get a longer answer that ends with a **Verification** section (cut off mid-sentence, because `generate_response` allows 200 new tokens).
 
 This method directly guides the model to produce the kind of detailed reasoning we are looking for.
 
@@ -1294,7 +1372,9 @@ def refine_output(messy_text):
     think_content = messy_text.split("<think>")[1].split("</think>")[0].strip()
     answer_content = messy_text.split("<answer>")[1].split("</answer>")[0].strip()
 
-    refined_text = f"""<|special_token|> Reasoning: {think_content.replace('umm...', '').strip().capitalize()}.
+    # Drop the filler word at the start ("umm...", "ummm...") and the dots at the end
+    think_content = re.sub(r"^u+m+\.*\s*", "", think_content).rstrip(".")
+    refined_text = f"""<|special_token|> Reasoning: {think_content.capitalize()}.
 <|special_token|> Summary: The answer is {answer_content}."""
     return refined_text
 
@@ -1364,8 +1444,8 @@ bespoke_rl['train'][0]
 
 #### OUTPUT ####
 {
-  'system': 'Your role as an assistant involves ... ',
-  'conversations': [{'from': 'user', 'value': 'Return your ...'}]
+  'system': 'Your role as an assistant involves thoroughly exploring questions thro ...',
+  'conversations': [{'from': 'user', 'value': 'Return your final response within \\boxed{}. The operation $\\otimes$ is ...'}, {'from': 'assistant', 'value': '<|begin_of_thought|>  Okay, let me try to figure out this problem. So, ...'}],
 }
 #### OUTPUT ####
 ```
@@ -1381,20 +1461,18 @@ MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 OUTPUT_DIR = "data/Qwen-SFT-training" # New output directory for SFT model
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Training Arguments - similar to GRPO, but adjust for SFT
-training_args = TrainingArguments(
+# SFT configuration - similar to GRPO (SFTConfig also extends TrainingArguments), but adjusted for SFT
+training_args = SFTConfig(
     output_dir=OUTPUT_DIR,
-    overwrite_output_dir=True,
-    num_train_epochs=1,         # Adjust epochs as needed
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=16,
-    gradient_accumulation_steps=2,
-    learning_rate=2e-5,        # Adjust learning rate for SFT
-    warmup_ratio=0.1,
+    num_train_epochs=1,             # Adjust epochs as needed
+    max_steps=200,                  # Stop after 200 steps (remove it to train the whole epoch)
+    per_device_train_batch_size=2,  # The reasoning traces are long, so fewer per device...
+    gradient_accumulation_steps=8,  # ...and more accumulation (16 conversations per step)
+    learning_rate=2e-5,             # Adjust learning rate for SFT
+    warmup_steps=0.1,
     weight_decay=0.01,
     logging_steps=10,
-    evaluation_strategy="no",
-    eval_steps=50,
+    eval_strategy="no",
     save_strategy="steps",
     save_steps=50,
     save_total_limit=2,
@@ -1404,25 +1482,15 @@ training_args = TrainingArguments(
     push_to_hub=False,
     gradient_checkpointing=True,
     report_to="none",
-    packing=True, # Enable data packing for efficiency
-    max_seq_length=4096 # Set max sequence length
-)
-
-# Model Configuration - same as before
-model_args = ModelConfig(
-    model_name_or_path=MODEL_NAME,
-    model_revision="main",
-    torch_dtype="bfloat16",
-    trust_remote_code=True,
-    attn_implementation="flash_attention_2"
+    max_length=4096,                # Truncate conversations longer than 4096 tokens
 )
 ```
 
-These TrainingArguments and ModelConfig are quite similar to what we used for GRPO, but with a few tweaks that are more suitable for SFT (like a slightly different learning rate, and importantly, packing=True and max_seq_length=4096 for efficient training on longer sequences).
+These settings are quite similar to what we used for GRPO, with a few tweaks that suit SFT: a different learning rate, fewer conversations per device with more gradient accumulation (the reasoning traces are long), and max_length=4096, which truncates the longest conversations. Packing several short conversations into one sequence would be faster, but TRL needs FlashAttention for that, so we leave it off.
 
 ## Stage 1 STF Training Loop
 
-Now, let’s load our dataset and tokenizer:
+Now, let’s load our dataset and tokenizer. We use the [HuggingFaceH4 copy of Bespoke-Stratos-17k](https://huggingface.co/datasets/HuggingFaceH4/Bespoke-Stratos-17k), which has the same conversations in the `messages` format (a list of `role`/`content` dictionaries) that SFTTrainer understands. Its `messages` hold the user and assistant turns only (the long system prompt stays in a separate column that we don't use), so the chat template adds Qwen's default system message instead.
 ```python
 # Load Bespoke-Stratos-17k dataset
 dataset_sft = load_dataset("HuggingFaceH4/Bespoke-Stratos-17k", split='train') # Only using train split for simplicity
@@ -1443,33 +1511,37 @@ And finally, we initialize the SFTTrainer and start training!
 model_sft = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     trust_remote_code=True,
-    torch_dtype=torch.bfloat16
+    dtype=torch.bfloat16
 )
 
 # Initialize the SFT Trainer
 sft_trainer = SFTTrainer(
     model=model_sft,                     # Our initialized Qwen model
     train_dataset=dataset_sft,           # Bespoke-Stratos-17k dataset
-    tokenizer=tokenizer,                 # Tokenizer
-    args=training_args,                  # Training arguments
-    dataset_text_field="conversations",  # Field in dataset containing text - IMPORTANT for SFT
-    packing=True,                        # Enable data packing
-    max_seq_length=4096                 # Max sequence length
+    processing_class=tokenizer,          # Tokenizer
+    args=training_args,                  # SFTConfig defined above
+    callbacks=callbacks,                 # Our logging callback from the GRPO part
 )
 
 # Start the SFT Training Loop
 sft_train_result = sft_trainer.train()
 ```
 
-When you run this code, you’ll see the SFT training process start. It will look similar to the GRPO training output, showing loss and learning rate at each logging step.
+When you run this code, you’ll see the SFT training process start. Our callback prints the loss and the learning rate every 10 steps:
 ```
+INFO:__main__:Step 10: Loss = 1.2096, Learning Rate = 9.00e-06
+INFO:__main__:Step 20: Loss = 1.0689, Learning Rate = 1.90e-05
+INFO:__main__:Step 30: Loss = 1.0269, Learning Rate = 1.90e-05
+INFO:__main__:Step 40: Loss = 0.9674, Learning Rate = 1.79e-05
+INFO:__main__:Step 50: Loss = 0.9293, Learning Rate = 1.68e-05
 ...
-INFO:__main__:Step 10: Loss = ..., Learning Rate = ...
-INFO:__main__:Step 20: Loss = ..., Learning Rate = ...
+INFO:__main__:Step 100: Loss = 0.9224, Learning Rate = 1.12e-05
 ...
+INFO:__main__:Step 150: Loss = 0.9425, Learning Rate = 5.67e-06
+...
+INFO:__main__:Step 200: Loss = 0.9157, Learning Rate = 1.11e-07
 ```
-
-Just like with GRPO, training time will depend on your hardware and chosen epochs. Since we’re still using a small model and only 1 epoch for this example, it should be reasonably quick.
+The loss falls from 1.21 at step 10 to 0.92 at step 200. The 200 steps took 19 minutes on one RTX A6000 and used at most 5.9 GB of GPU memory. They cover 3,200 of the 16,610 conversations; a whole epoch is about 1,040 steps. 43% of the conversations are longer than 4,096 tokens, so they lose their ending, where the final solution is, to truncation.
 
 ## Saving Tiny R1 LLM
 
@@ -1485,9 +1557,51 @@ tokenizer.save_pretrained(TRAINED_SFT_MODEL_PATH)
 sft_trainer.save_model(TRAINED_SFT_MODEL_PATH)
 
 print(f"SFT Trained model saved to {TRAINED_SFT_MODEL_PATH}")
+
+
+#### OUTPUT ####
+SFT Trained model saved to data/Qwen-SFT-training
+#### OUTPUT ####
 ```
 
-And that’s it for the SFT part! We’ve now taken our base model, shown it lots of examples of good reasoning, and fine-tuned it to be better at producing clear, structured responses.
+Let’s ask our SFT model the same test problem we gave the GRPO model:
+```python
+# Testing Inference with the SFT Model
+sft_model = sft_trainer.model.eval()  # eval mode: no dropout, and generate() can use its cache
+
+# The training conversations have no system message, so the chat template adds Qwen's default one,
+# both during training and here
+messages = [{"role": "user", "content": dataset['test'][0]['problem']}]
+
+text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = tokenizer(text, return_tensors="pt").to(sft_model.device)
+outputs = sft_model.generate(**inputs, max_new_tokens=2048, do_sample=True, temperature=0.7)
+
+print(f"Test Input: {dataset['test'][0]['problem']}")
+print(f"SFT Model Response: {tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)}")
+
+
+#### OUTPUT ####
+Test Input: In 1988, a person's age was equal to the sum of the digits of their birth year. How old was this person?
+SFT Model Response: <|begin_of_thought|>
+
+Okay, let me try to figure out how old someone in 1988 was based on their age being equal to the sum of the digits of their birth year. Hmm, so first, I need to find out what their birth year was. Since they were born in 1988, that would mean it's my year of birth as well. So if they were 52 years old in 1988 (since 1988 - 1987 = 1), then the sum of the digits would be 5 + 2 = 7. Therefore, my age is 7.
+
+But wait, I don't know when or where I was born. Maybe I'm thinking about something else here. Let me think again. The problem says "their age was equal to the sum of the digits of their birth year." So maybe there's another person with the same birth year and their age is 7, but I have no idea who that might be. 
+
+Alternatively, maybe I should look for someone whose birth year is 1988 and whose age is also 7. But since I can't recall any such person, maybe I need to check other possibilities?
+...
+
+Both conditions match: the birth year is 1936 and the digit sum is 19. Hence, the person's age is 52, which confirms our solution.
+
+Thus, the final answer is \(\boxed{1981}\).
+
+<|end_of_solution|>
+#### OUTPUT ####
+```
+After 200 steps the model writes like the Bespoke-Stratos traces: it opens with `<|begin_of_thought|>`, second-guesses itself (“But wait”, “Let me think again”) and ends with a `<|begin_of_solution|>` section and a boxed answer. The reasoning is muddled and the answer is wrong (the person was 22, not 1981): 200 steps on 3,200 conversations teach the format, not the math.
+
+And that’s it for the SFT part!We’ve now taken our base model, shown it lots of examples of good reasoning, and fine-tuned it to be better at producing clear, structured responses.
 > This finetuned model using SFT is what we called R1 after SFT stage 1
 
 The steps after SFT, especially the RL stages and rejection sampling, are complex to implement from scratch in Python. Focusing on the theoretical understanding is key to understand the overall process.

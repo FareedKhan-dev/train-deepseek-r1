@@ -327,7 +327,7 @@ Over time, the model **learns from its mistakes**, becoming more accurate and ef
 
 ## Two main problems with R1 Zero
 
-After DeepSeek-R1 Zero was created using RL training process on V3 model, Researches saw the trained model performed really well on reasoning tests, even scoring similarly to more advanced models like **OpenAI-01–0912** on tasks like **AIME 2024**. This showed that using reinforcement learning (RL) to encourage reasoning in language models is a promising approach.
+After DeepSeek-R1 Zero was created using RL training process on V3 model, Researches saw the trained model performed really well on reasoning tests, even scoring similarly to more advanced models like **OpenAI-o1-0912** on tasks like **AIME 2024**. This showed that using reinforcement learning (RL) to encourage reasoning in language models is a promising approach.
 
 But they also noticed DeepSeek-R1-Zero had some key issues that needed fixing for real world use and wider research.
 
