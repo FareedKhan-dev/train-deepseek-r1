@@ -1,0 +1,8 @@
+# Checkpoints and models the notebook writes
+data/
+
+# Python and Jupyter
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
